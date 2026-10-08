@@ -71,10 +71,14 @@ type ReadOptions = {
   readonly timeoutMs?: number | undefined;
   readonly signal?: AbortSignal | undefined;
 };
-type ReadStage = <T>(stage: string, operation: (timeoutMs: number) => Promise<T>) => Promise<T>;
+type ReadStage = <T>(
+  stage: string,
+  operation: (timeoutMs: number) => Promise<T>,
+  onInterrupt?: () => void,
+) => Promise<T>;
 
 /** One deadline across parallel and sequential stages, below the broker's 15s deadline. */
-const withReadBudget = async <T>(
+export const withReadBudget = async <T>(
   options: ReadOptions,
   operation: (read: ReadStage) => Promise<T>,
 ): Promise<T> => {
@@ -97,7 +101,7 @@ const withReadBudget = async <T>(
   const deadline = Date.now() + timeoutMs;
   const pending = new Set<() => void>();
   let closed = false;
-  const read: ReadStage = (stage, start) =>
+  const read: ReadStage = (stage, start, onInterrupt) =>
     new Promise((resolve, reject) => {
       const timedOut = () =>
         new ServerBrowserOperationError(
@@ -107,6 +111,7 @@ const withReadBudget = async <T>(
         );
       let timer: ReturnType<typeof setTimeout> | undefined;
       let settled = false;
+      let started = false;
       const finish = (complete: () => void) => {
         if (settled) return;
         settled = true;
@@ -115,7 +120,11 @@ const withReadBudget = async <T>(
         pending.delete(onAbort);
         complete();
       };
-      const onAbort = () => finish(() => reject(interrupted(stage)));
+      const onAbort = () =>
+        finish(() => {
+          if (started) onInterrupt?.();
+          reject(interrupted(stage));
+        });
       if (closed || options.signal?.aborted) {
         onAbort();
         return;
@@ -127,7 +136,14 @@ const withReadBudget = async <T>(
       }
       pending.add(onAbort);
       options.signal?.addEventListener("abort", onAbort, { once: true });
-      timer = setTimeout(() => finish(() => reject(timedOut())), remainingMs);
+      timer = setTimeout(
+        () =>
+          finish(() => {
+            onInterrupt?.();
+            reject(timedOut());
+          }),
+        remainingMs,
+      );
       const fail = (cause: unknown) =>
         finish(() =>
           reject(
@@ -137,8 +153,9 @@ const withReadBudget = async <T>(
           ),
         );
       try {
-        // CDP and Playwright cannot cancel an individual in-flight call. Keep both
-        // handlers attached after expiry, without terminating the shared page.
+        // Keep both handlers attached after expiry so late replies cannot affect
+        // newer work. Only an evaluation opts into terminating an interrupted script.
+        started = true;
         start(remainingMs).then(
           (value) => finish(() => (Date.now() >= deadline ? reject(timedOut()) : resolve(value))),
           fail,
@@ -531,20 +548,37 @@ export const scroll = async (page: Page, input: PreviewAutomationScrollInput) =>
   await locator.evaluate((element, [x, y]) => element.scrollBy(x, y), delta);
 };
 
+/**
+ * Bound evaluation by the remaining request budget. Terminate a still-running
+ * script on timeout or cancellation before releasing the tab queue.
+ */
 export const evaluate = async (
   cdp: CDPSession,
   input: PreviewAutomationEvaluateInput,
-  options: ReadOptions = {},
+  options: ReadOptions | number = {},
 ) => {
-  const result = await withReadBudget(options, (read) =>
-    read("Runtime.evaluate", (timeoutMs) =>
-      cdp.send("Runtime.evaluate", {
-        expression: input.expression,
-        awaitPromise: input.awaitPromise ?? true,
-        returnByValue: input.returnByValue ?? true,
-        timeout: timeoutMs,
-      }),
-    ),
+  const result = await withReadBudget(
+    typeof options === "number" ? { timeoutMs: options } : options,
+    (read) =>
+      read(
+        "Runtime.evaluate",
+        (timeoutMs) =>
+          cdp.send("Runtime.evaluate", {
+            expression: input.expression,
+            awaitPromise: input.awaitPromise ?? true,
+            returnByValue: input.returnByValue ?? true,
+            timeout: timeoutMs,
+          }),
+        () => {
+          // Send before the queue can start a newer evaluation. A detached
+          // session must not turn deadline cleanup into an unhandled rejection.
+          try {
+            void cdp.send("Runtime.terminateExecution").catch(constVoid);
+          } catch {
+            // A synchronously detached session is already unable to run scripts.
+          }
+        },
+      ),
   );
   if (result.exceptionDetails) {
     throw new ServerBrowserOperationError(

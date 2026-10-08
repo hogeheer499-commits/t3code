@@ -32,6 +32,8 @@ const makeBrowser = () => {
         return Promise.resolve({ data: "image" });
       case "Runtime.evaluate":
         return Promise.resolve({ result: { value: 42 } });
+      case "Runtime.terminateExecution":
+        return Promise.resolve({});
       default:
         return Promise.reject(new Error(`Unexpected CDP method: ${method}`));
     }
@@ -302,8 +304,87 @@ describe("bounded server browser reads", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(browser.send.mock.calls.map(([method]) => method)).toEqual([
       "Runtime.evaluate",
+      "Runtime.terminateExecution",
       "Runtime.evaluate",
     ]);
+  });
+
+  it.each(["throws", "rejects"])(
+    "preserves deadline failure and recovery when termination %s",
+    async (failureMode) => {
+      const browser = makeBrowser();
+      const abort = observeAbort();
+      const send = browser.send.getMockImplementation()!;
+      browser.send.mockImplementation((method, params) => {
+        if (method === "Runtime.terminateExecution") {
+          const failure = new Error("Session detached");
+          if (failureMode === "throws") throw failure;
+          return Promise.reject(failure);
+        }
+        return send(method, params);
+      });
+      browser.send.mockReturnValueOnce(new Promise<never>(() => {}));
+      const failed = expect(
+        ServerBrowserPage.evaluate(
+          browser.cdp,
+          { expression: "new Promise(() => {})" },
+          { timeoutMs: 100, signal: abort.controller.signal },
+        ),
+      ).rejects.toMatchObject({ tag: "PreviewAutomationTimeoutError" });
+      await vi.advanceTimersByTimeAsync(100);
+      await failed;
+      abort.expectClean();
+      expect(await ServerBrowserPage.evaluate(browser.cdp, { expression: "42" })).toBe(42);
+      expect(browser.send.mock.calls.map(([method]) => method)).toEqual([
+        "Runtime.evaluate",
+        "Runtime.terminateExecution",
+        "Runtime.evaluate",
+      ]);
+      abort.expectClean();
+    },
+  );
+
+  it("does not terminate newer work after an earlier evaluation succeeds or is cancelled", async () => {
+    const browser = makeBrowser();
+    expect(
+      await ServerBrowserPage.evaluate(browser.cdp, { expression: "42" }, { timeoutMs: 100 }),
+    ).toBe(42);
+    const abort = observeAbort();
+    const stalled = deferred<never>();
+    browser.send.mockReturnValueOnce(stalled.promise);
+    const interrupted = expect(
+      ServerBrowserPage.evaluate(
+        browser.cdp,
+        { expression: "new Promise(() => {})" },
+        { timeoutMs: 100, signal: abort.controller.signal },
+      ),
+    ).rejects.toMatchObject({ tag: "PreviewAutomationControlInterruptedError" });
+    abort.controller.abort();
+    await interrupted;
+    abort.expectClean();
+    expect(browser.send.mock.calls.map(([method]) => method)).toEqual([
+      "Runtime.evaluate",
+      "Runtime.evaluate",
+      "Runtime.terminateExecution",
+    ]);
+    const next = deferred<{ result: { value: number } }>();
+    browser.send.mockReturnValueOnce(next.promise);
+    const fresh = ServerBrowserPage.evaluate(browser.cdp, { expression: "42" }, { timeoutMs: 200 });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(browser.send.mock.calls.map(([method]) => method)).toEqual([
+      "Runtime.evaluate",
+      "Runtime.evaluate",
+      "Runtime.terminateExecution",
+      "Runtime.evaluate",
+    ]);
+    next.resolve({ result: { value: 42 } });
+    expect(await fresh).toBe(42);
+    stalled.reject(new Error("Late cancelled evaluation"));
+    await vi.advanceTimersByTimeAsync(200);
+    abort.expectClean();
+    expect(
+      browser.send.mock.calls.filter(([method]) => method === "Runtime.terminateExecution"),
+    ).toHaveLength(1);
   });
 
   it.each(["capture", "evaluate"])("cleans up an aborted %s read", async (operation) => {
