@@ -1429,7 +1429,7 @@ it.effect("rejects a routed action when its generation is evicted before deliver
   ),
 );
 
-it.effect.each(["snapshot", "evaluate"] as const)(
+it.effect.each(["snapshot", "evaluate", "navigate"] as const)(
   "retains an opted-in host, pending open, and session tabs after a %s timeout",
   (operation) =>
     Effect.scoped(
