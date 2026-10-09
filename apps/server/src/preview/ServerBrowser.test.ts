@@ -41,6 +41,7 @@ vi.mock("./ServerBrowserContexts.ts", () => ({
     }
     async contextFor(profileId: string, isolationKey?: string) {
       contextRequests.push({ profileId, isolated: isolationKey !== undefined });
+      contextLaunchStarted?.resolve();
       if (contextFailure) throw contextFailure;
       await contextGate?.promise;
       const context = makeContext(this.onClose);
@@ -154,6 +155,7 @@ const contexts: ReturnType<typeof makeContext>[] = [];
 /** The profile and isolation each headless tab asked its context for. */
 const contextRequests: Array<{ profileId: string; isolated: boolean }> = [];
 let contextGate: PromiseWithResolvers<void> | null = null;
+let contextLaunchStarted: PromiseWithResolvers<void> | null = null;
 type ClipboardBinding = (source: { page: unknown }, text: unknown) => void;
 let clipboardBinding: ClipboardBinding | null = null;
 let contextFailure: Error | null = null;
@@ -272,6 +274,7 @@ beforeEach(() => {
   contexts.length = 0;
   contextRequests.length = 0;
   contextGate = null;
+  contextLaunchStarted = null;
   contextFailure = null;
   desktopTabs.clear();
   desktopRendersNext = false;
@@ -1597,6 +1600,135 @@ it.effect.each([0, 400])(
         expect(timeout).toBeLessThanOrEqual(900 - queuedMs);
       }),
     ).pipe(Effect.provide(layer)),
+);
+
+it.effect.each([
+  {
+    operation: "open" as const,
+    queuedMs: 0,
+    inputTimeoutMs: undefined,
+    readiness: "load" as const,
+  },
+  {
+    operation: "open" as const,
+    queuedMs: 400,
+    inputTimeoutMs: undefined,
+    readiness: "load" as const,
+  },
+  {
+    operation: "navigate" as const,
+    queuedMs: 0,
+    inputTimeoutMs: undefined,
+    readiness: "load" as const,
+  },
+  {
+    operation: "navigate" as const,
+    queuedMs: 400,
+    inputTimeoutMs: 5_000,
+    readiness: "load" as const,
+  },
+  {
+    operation: "navigate" as const,
+    queuedMs: 400,
+    inputTimeoutMs: 250,
+    readiness: "load" as const,
+  },
+  {
+    operation: "navigate" as const,
+    queuedMs: 400,
+    inputTimeoutMs: undefined,
+    readiness: "none" as const,
+  },
+])(
+  "$operation navigation uses the remaining budget after $queuedMs ms queued (input timeout $inputTimeoutMs, readiness $readiness)",
+  ({ operation, queuedMs, inputTimeoutMs, readiness }) =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const { broker, tabId } = yield* ready;
+        const session = contexts[0]!.sessions[0]!;
+        const started = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        yield* Effect.addFinalizer(() => Effect.sync(() => release.resolve()));
+        const send = session.send.getMockImplementation()!;
+        session.send.mockImplementation(async (method, input) => {
+          if (
+            method === "Runtime.evaluate" &&
+            (input as { expression?: string }).expression === "blocking()"
+          ) {
+            started.resolve();
+            await release.promise;
+          }
+          return send(method, input);
+        });
+        const first = yield* broker
+          .invoke<string>({
+            scope,
+            tabId,
+            operation: "evaluate",
+            input: { expression: "blocking()" },
+          })
+          .pipe(Effect.forkScoped);
+        yield* Effect.promise(() => started.promise);
+        const url = "http://localhost:5173/budgeted-navigation";
+        const navigation = yield* broker
+          .invoke<PreviewAutomationStatus>({
+            scope,
+            tabId,
+            operation,
+            input: {
+              url,
+              ...(operation === "open" ? { open: false } : { readiness }),
+              ...(inputTimeoutMs === undefined ? {} : { timeoutMs: inputTimeoutMs }),
+            },
+            timeoutMs: 1_000,
+          })
+          .pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        yield* broker.invoke({ scope, tabId, operation: "status", input: {} });
+        yield* TestClock.adjust(queuedMs);
+        expect(contexts[0]!.page.goto).not.toHaveBeenCalled();
+        release.resolve();
+        yield* Fiber.join(first);
+        expect((yield* Fiber.join(navigation)).available).toBe(true);
+        expect(contexts[0]!.page.goto).toHaveBeenCalledWith(url, {
+          timeout: Math.min(inputTimeoutMs ?? 1_000, 900 - queuedMs),
+          waitUntil: readiness === "none" ? "commit" : "load",
+        });
+        expect(
+          yield* broker.invoke<string>({
+            scope,
+            tabId,
+            operation: "evaluate",
+            input: { expression: "document.title" },
+          }),
+        ).toBe("evaluated");
+      }),
+    ).pipe(Effect.provide(layer)),
+);
+
+it.effect("opening a new tab budgets its load wait after browser setup", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* ServerBrowser.ServerBrowser;
+      const broker = yield* Broker.PreviewAutomationBroker;
+      contextGate = Promise.withResolvers<void>();
+      contextLaunchStarted = Promise.withResolvers<void>();
+      yield* Effect.addFinalizer(() => Effect.sync(() => contextGate?.resolve()));
+      const opened = yield* broker
+        .invoke<PreviewAutomationStatus>({
+          scope,
+          operation: "open",
+          input: { url: "http://localhost:5173/new-budgeted", open: false },
+          timeoutMs: 1_000,
+        })
+        .pipe(Effect.forkScoped);
+      yield* Effect.promise(() => contextLaunchStarted!.promise);
+      yield* TestClock.adjust(400);
+      contextGate.resolve();
+      expect((yield* Fiber.join(opened)).available).toBe(true);
+      expect(contexts[0]!.page.waitForLoadState).toHaveBeenCalledWith("load", { timeout: 500 });
+    }),
+  ).pipe(Effect.provide(layer)),
 );
 
 it.effect("cancelling a caller revokes its queued click before the tab is released", () =>

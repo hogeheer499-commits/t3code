@@ -1783,7 +1783,8 @@ const make = Effect.gen(function* () {
                 "dialogPending",
               );
             if (existing) {
-              if (url) await navigate(tab, url, "load", navigationTimeout);
+              if (url)
+                await navigate(tab, url, "load", Math.min(navigationTimeout, remainingTimeoutMs()));
             } else {
               // Await the original navigation failure even though background creation keeps the tab.
               await tab.initialNavigation;
@@ -1801,7 +1802,9 @@ const make = Effect.gen(function* () {
             }
             if (!existing && url) {
               await tab.page
-                .waitForLoadState("load", { timeout: navigationTimeout })
+                .waitForLoadState("load", {
+                  timeout: Math.min(navigationTimeout, remainingTimeoutMs()),
+                })
                 .catch(constVoid);
             }
             return statusWithTitle(tab, request.agentSessionId);
@@ -1918,7 +1921,7 @@ const make = Effect.gen(function* () {
             tab,
             resolveNavigationUrl(navigateInput),
             navigateInput.readiness ?? "load",
-            navigateInput.timeoutMs ?? request.timeoutMs,
+            Math.min(navigateInput.timeoutMs ?? request.timeoutMs, remainingTimeoutMs()),
           ),
         );
         return statusWithTitle(tab, request.agentSessionId);
