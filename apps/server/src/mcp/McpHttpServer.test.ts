@@ -244,7 +244,8 @@ it.effect("tells the agent how to fall back when no desktop app can run the snap
 );
 
 it.effect.each([
-  { mode: "default", input: {}, images: true, legacyHost: false },
+  { mode: "default", input: {}, images: false, legacyHost: false },
+  { mode: "default from an older host", input: {}, images: false, legacyHost: true },
   { mode: "explicit image", input: { includeImage: true }, images: true, legacyHost: false },
   { mode: "text only", input: { includeImage: false }, images: false, legacyHost: false },
   {
@@ -293,7 +294,7 @@ it.effect.each([
           tabId: alternateTabId,
           threadId,
         });
-        const capture = requests > 6 || images;
+        const capture = requests <= 6 && images;
         expect(event.request.input).toEqual(capture ? {} : { includeImage: false });
         return broker.respond({
           clientId: "mcp-image-option-client",
@@ -363,13 +364,11 @@ it.effect.each([
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.provideService(McpSchema.McpServerClient, client),
         );
-      expect(nextDefault.content.map((content) => content.type)).toEqual([
-        "text",
-        "text",
-        "text",
-        "image",
-      ]);
-      expect(nextDefault.structuredContent).toMatchObject({ title: "Snapshot 7", screenshot });
+      expect(nextDefault.content.map((content) => content.type)).toEqual(["text", "text", "text"]);
+      expect(nextDefault.structuredContent).toMatchObject({ title: "Snapshot 7" });
+      if (legacyHost)
+        expect(nextDefault.structuredContent).toHaveProperty("screenshot", screenshot);
+      else expect(nextDefault.structuredContent).not.toHaveProperty("screenshot");
       expect(nextDefault.structuredContent).not.toHaveProperty("accessibilityTree");
       expect(requests).toBe(7);
     }),
@@ -428,11 +427,12 @@ it.effect("saves the snapshot PNG on request and reports its path", () =>
       const path = yield* Path.Path;
       const inputs = yield* serveSnapshots("mcp-save-client", snapshotResult);
 
-      const snapshot = yield* callSnapshot({ save: true });
+      const snapshot = yield* callSnapshot({ save: true, includeImage: true });
 
       expect(snapshot.isError).toBe(false);
       // The browser never receives the server-only `save` flag.
       expect(inputs).toEqual([{}]);
+      expect(snapshot.content.map((content) => content.type)).toContain("image");
       const structured = snapshot.structuredContent as { readonly screenshotPath?: string };
       const screenshotPath = structured.screenshotPath;
       expect(typeof screenshotPath).toBe("string");
@@ -448,15 +448,27 @@ it.effect("saves the snapshot PNG on request and reports its path", () =>
       expect(unsaved.structuredContent).not.toHaveProperty("screenshotPath");
 
       // A save without the image skips the page dump.
-      const pathOnly = yield* callSnapshot({ save: true, includeImage: false });
+      const pathOnly = yield* callSnapshot({ save: true });
       const saved = pathOnly.structuredContent as { readonly screenshotPath: string };
       expect(saved).toEqual({ url: snapshotResult.url, screenshotPath: expect.any(String) });
       expect(Buffer.from(yield* fileSystem.readFile(saved.screenshotPath)).toString()).toBe("png");
       const [only, ...others] = pathOnly.content;
       expect(others).toEqual([]);
       expect(only?.type === "text" ? decodeJsonText(only.text) : null).toEqual(saved);
-      // Both saved variants request a full capture even when the caller hides the image.
-      expect(inputs).toEqual([{}, {}, {}]);
+      const explicitPathOnly = yield* callSnapshot({ save: true, includeImage: false });
+      expect(explicitPathOnly.structuredContent).toEqual({
+        url: snapshotResult.url,
+        screenshotPath: expect.any(String),
+      });
+      expect(explicitPathOnly.content.map((content) => content.type)).toEqual(["text"]);
+      const explicitSaved = explicitPathOnly.structuredContent as {
+        readonly screenshotPath: string;
+      };
+      expect(Buffer.from(yield* fileSystem.readFile(explicitSaved.screenshotPath)).toString()).toBe(
+        "png",
+      );
+      // Saves always capture; the unsaved default call is text-only.
+      expect(inputs).toEqual([{}, { includeImage: false }, {}, {}]);
     }),
   ).pipe(Effect.provide(layerTest)),
 );
@@ -865,8 +877,8 @@ it.effect("registers annotated tools and preserves authenticated request context
       expect(statusTool?.tool.annotations?.destructiveHint).toBe(false);
 
       const snapshotTool = server.tools.find(({ tool }) => tool.name === "preview_snapshot");
-      expect(snapshotTool?.tool.annotations?.readOnlyHint).toBe(true);
-      expect(snapshotTool?.tool.annotations?.idempotentHint).toBe(true);
+      expect(snapshotTool?.tool.annotations?.readOnlyHint).toBe(false);
+      expect(snapshotTool?.tool.annotations?.idempotentHint).toBe(false);
       expect(snapshotTool?.tool.annotations?.openWorldHint).toBe(true);
       // This formatter advertises no required PNG output schema to MCP clients.
       // PreviewAutomationSnapshot validates the host result inside this server.
@@ -908,7 +920,10 @@ it.effect("registers annotated tools and preserves authenticated request context
       expect(malformed._tag).toBe("InvalidParams");
 
       const snapshot = yield* server
-        .callTool({ name: "preview_snapshot", arguments: { tabId: alternateTabId } })
+        .callTool({
+          name: "preview_snapshot",
+          arguments: { tabId: alternateTabId, includeImage: true },
+        })
         .pipe(
           Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
           Effect.provideService(McpSchema.McpServerClient, client),

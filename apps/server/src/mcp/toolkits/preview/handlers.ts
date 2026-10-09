@@ -213,7 +213,7 @@ const handlers = {
     return invokeTargeted<PreviewAutomationSnapshot>("snapshot", {
       ...operationInput,
       // Saving still needs a capture even when the response contains only its path.
-      ...(includeImage === false && save !== true ? { includeImage: false } : {}),
+      ...(includeImage !== true && save !== true ? { includeImage: false } : {}),
     });
   }),
   preview_click: McpToolAccess.actsAsCaller((input) =>
