@@ -42,6 +42,8 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 
+const HOST_RESPONSE_GRACE_MS = 1_000;
+
 export interface PreviewAutomationInvokeInput {
   /** Preview tabs belong to a thread, so only thread callers reach the broker. */
   readonly scope: McpInvocationContext.McpThreadInvocationScope;
@@ -547,16 +549,16 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
       return;
     }
     const deadlineMs = pending.deadlineMs;
-    // Retirement interrupts host work, while execution failures keep their
-    // error channel. Interruption aborts the host's native signal so its
-    // dispatcher can revoke actions that have not started yet.
+    // Retirement and the original deadline interrupt host work, while
+    // execution failures keep their error channel. Response grace only covers
+    // reply delivery; interruption still revokes native work on its deadline.
     yield* Effect.raceFirst(
       Deferred.await(pending.retired),
       Effect.gen(function* () {
         const live = yield* SynchronizedRef.modify(state, (current) => [current, current] as const);
         const remainingTimeoutMs = deadlineMs - (yield* Clock.currentTimeMillis);
         if (live.pending.get(request.requestId) !== pending || remainingTimeoutMs <= 0) return;
-        yield* execute(remainingTimeoutMs);
+        yield* execute(remainingTimeoutMs).pipe(Effect.timeoutOption(remainingTimeoutMs));
       }),
     );
   });
@@ -721,9 +723,15 @@ export const make = Effect.gen(function* PreviewAutomationBrokerMake() {
               }
               return yield* new PreviewAutomationRequestQueueClosedError(requestContext);
             }
-            const remainingTimeoutMs = Math.max(0, deadlineMs - (yield* Clock.currentTimeMillis));
+            // Reply grace extends response delivery, not guarded execution's original deadline.
+            const responseDeadlineMs =
+              input.updateCurrentTab === false ? deadlineMs : deadlineMs + HOST_RESPONSE_GRACE_MS;
+            const remainingResponseTimeoutMs = Math.max(
+              0,
+              responseDeadlineMs - (yield* Clock.currentTimeMillis),
+            );
             const result = yield* Deferred.await(deferred).pipe(
-              Effect.timeoutOption(remainingTimeoutMs),
+              Effect.timeoutOption(remainingResponseTimeoutMs),
             );
             return yield* Option.match(result, {
               onNone: () =>

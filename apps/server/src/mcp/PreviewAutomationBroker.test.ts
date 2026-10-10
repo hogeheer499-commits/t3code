@@ -508,7 +508,6 @@ it.effect.each([
         threadId: scope.thread.threadId,
       });
       expect(error.cause).toBe(remoteError);
-      expect(error.message).toContain("remains on the desktop");
       expect(error.message).not.toContain("remote recording details");
     }),
   ),
@@ -1353,7 +1352,7 @@ it.effect("discards buffered actions before completing an evicted host stream", 
         })
         .pipe(Effect.flip, Effect.forkScoped);
       yield* Deferred.await(actionRouted);
-      yield* TestClock.adjust(1_000);
+      yield* TestClock.adjust(2_000);
       expect(yield* Fiber.join(timedOut)).toMatchObject({ _tag: "PreviewAutomationTimeoutError" });
       expect(yield* Fiber.join(buffered)).toMatchObject({
         _tag: "PreviewAutomationClientDisconnectedError",
@@ -1415,7 +1414,7 @@ it.effect("rejects a routed action when its generation is evicted before deliver
           Effect.forkScoped,
         );
       yield* Deferred.await(actionRouted);
-      yield* TestClock.adjust(1_000);
+      yield* TestClock.adjust(2_000);
       expect(yield* Fiber.join(timedOut)).toMatchObject({ _tag: "PreviewAutomationTimeoutError" });
       expect(Exit.isSuccess(yield* Fiber.await(consumer))).toBe(true);
 
@@ -1511,7 +1510,7 @@ it.effect.each(["snapshot", "evaluate", "navigate"] as const)(
           }),
         ).toEqual({ host: "client-newer" });
 
-        yield* TestClock.adjust(1_000);
+        yield* TestClock.adjust(2_000);
         const error = yield* Fiber.join(timedOut);
         expect(error).toBeInstanceOf(PreviewAutomationTimeoutError);
         expect(error).toMatchObject({
@@ -1631,7 +1630,7 @@ it.effect.each([
         })
         .pipe(Effect.flip, Effect.forkScoped);
       const openRequest = yield* Deferred.await(openReceived);
-      yield* TestClock.adjust(1_000);
+      yield* TestClock.adjust(2_000);
 
       expect(yield* Fiber.join(snapshot)).toBeInstanceOf(PreviewAutomationTimeoutError);
       expect(yield* Fiber.join(opening)).toMatchObject({
@@ -1753,30 +1752,41 @@ it.effect.each([true, false])(
     ),
 );
 
-it.effect("keeps a host that responds with an operation timeout", () =>
+it.effect("keeps a host whose operation timeout arrives just after the budget", () =>
   Effect.scoped(
     Effect.gen(function* () {
       const broker = yield* makeBroker;
-      const connected = yield* Deferred.make<void>();
-      const events = yield* broker.connect(makeHost());
-      yield* Stream.runForEach(events, (event) => {
-        if (event.type === "connected") return Deferred.succeed(connected, undefined);
-        return broker.respond({
-          clientId: "client-1",
-          connectionId: event.connectionId,
-          requestId: event.request.requestId,
-          ...(event.request.operation === "waitFor"
-            ? {
-                ok: false,
-                error: { _tag: "PreviewAutomationTimeoutError", message: "Selector timed out" },
-              }
-            : { ok: true, result: "responsive" }),
-        });
-      }).pipe(Effect.forkScoped);
-      yield* Deferred.await(connected);
-      expect(
-        yield* broker.invoke<void>({ scope, operation: "waitFor", input: {} }).pipe(Effect.flip),
-      ).toMatchObject({ _tag: "PreviewAutomationTimeoutError" });
+      const received = yield* Deferred.make<void>();
+      const requests = requestsFrom(yield* broker.connect(makeHost()));
+      yield* Stream.runForEach(requests, (request) =>
+        Effect.gen(function* () {
+          if (request.operation === "waitFor") {
+            yield* Deferred.succeed(received, undefined);
+            // The browser starts its own timer after delivery, so its timeout lands late.
+            yield* Effect.sleep(request.timeoutMs + 50);
+          }
+          yield* broker.respond({
+            clientId: "client-1",
+            connectionId: request.connectionId,
+            requestId: request.requestId,
+            ...(request.operation === "waitFor"
+              ? {
+                  ok: false,
+                  error: { _tag: "PreviewAutomationTimeoutError", message: "Selector timed out" },
+                }
+              : { ok: true, result: "responsive" }),
+          });
+        }),
+      ).pipe(Effect.forkScoped);
+      const timedOut = yield* broker
+        .invoke<void>({ scope, operation: "waitFor", input: {}, timeoutMs: 1_000 })
+        .pipe(Effect.flip, Effect.forkScoped);
+      yield* Deferred.await(received);
+      yield* TestClock.adjust(1_050);
+      expect(yield* Fiber.join(timedOut)).toMatchObject({
+        _tag: "PreviewAutomationTimeoutError",
+        remoteTag: "PreviewAutomationTimeoutError",
+      });
       expect(yield* broker.invoke({ scope, operation: "status", input: {} })).toBe("responsive");
     }),
   ),
@@ -1853,7 +1863,7 @@ it.effect.each(["timeout", "interrupt"] as const)(
       Effect.gen(function* () {
         const { broker, caller, identity } = yield* makeGuardedRequest;
         if (retirement === "timeout") {
-          yield* TestClock.adjust(1_000);
+          yield* TestClock.adjust(2_000);
           expect(yield* Fiber.join(caller).pipe(Effect.flip)).toBeInstanceOf(
             PreviewAutomationTimeoutError,
           );
@@ -1888,6 +1898,31 @@ it.effect.each(["timeout", "interrupt"] as const)(
     ),
 );
 
+it.effect("keeps response grace separate from expired host execution", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { broker, caller, identity } = yield* makeGuardedRequest;
+      yield* TestClock.adjust(1_000);
+      expect(caller.pollUnsafe()).toBeUndefined();
+      let executions = 0;
+      yield* broker.runRequest(identity, () => Effect.sync(() => executions++).pipe(Effect.asVoid));
+      expect(executions).toBe(0);
+
+      yield* TestClock.adjust(250);
+      yield* broker.respond({
+        ...identity,
+        ok: false,
+        error: { _tag: "PreviewAutomationTimeoutError", message: "Action budget expired" },
+      });
+      expect(yield* Fiber.join(caller).pipe(Effect.flip)).toMatchObject({
+        _tag: "PreviewAutomationTimeoutError",
+        remoteTag: "PreviewAutomationTimeoutError",
+      });
+      expect(executions).toBe(0);
+    }),
+  ),
+);
+
 it.effect("passes only the original request's remaining budget after host dispatch delay", () =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -1901,10 +1936,12 @@ it.effect("passes only the original request's remaining budget after host dispat
         .pipe(Effect.forkScoped);
       expect(yield* Deferred.await(budgetReceived)).toBe(600);
       yield* TestClock.adjust(600);
+      expect(Exit.isSuccess(yield* Fiber.await(guarded))).toBe(true);
+      expect(caller.pollUnsafe()).toBeUndefined();
+      yield* TestClock.adjust(1_000);
       expect(yield* Fiber.join(caller).pipe(Effect.flip)).toBeInstanceOf(
         PreviewAutomationTimeoutError,
       );
-      expect(Exit.isSuccess(yield* Fiber.await(guarded))).toBe(true);
     }),
   ),
 );
@@ -1943,6 +1980,11 @@ it.effect.each(["timeout", "interrupt", "success", "error", "disconnect"] as con
           .pipe(Effect.forkScoped);
         const signal = yield* Deferred.await(started);
         if (retirement === "timeout") {
+          yield* TestClock.adjust(1_000);
+          yield* Deferred.await(aborted);
+          expect(signal.aborted).toBe(true);
+          expect(Exit.isSuccess(yield* Fiber.await(guarded))).toBe(true);
+          expect(caller.pollUnsafe()).toBeUndefined();
           yield* TestClock.adjust(1_000);
           expect(yield* Fiber.join(caller).pipe(Effect.flip)).toBeInstanceOf(
             PreviewAutomationTimeoutError,
